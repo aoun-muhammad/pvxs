@@ -1,0 +1,161 @@
+name: Build and publish binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to create/update (e.g. v1.2.3). If empty, build artifacts only.'
+        required: false
+        default: ''
+      base:
+        description: 'EPICS Base version (e.g. 7.0, R7.0.7, 3.15)'
+        required: false
+        default: '7.0'
+
+env:
+  SETUP_PATH: .ci-local
+  _PVXS_ABORT_ON_CRIT: 1
+  PVXS_LOG: pvxs.*=WARN
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    env:
+      CMP: ${{ matrix.cmp }}
+      BCFG: ${{ matrix.bcfg }}
+      BASE: ${{ inputs.base }}
+      SET: defaults
+      VV: '1'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64 Release (vs2022)
+            os: windows-2022
+            cmp: vs2022
+            bcfg: default
+            artifact: pvxs-windows-x64-release
+
+          - name: Windows x64 Debug (vs2022)
+            os: windows-2022
+            cmp: vs2022
+            bcfg: debug
+            artifact: pvxs-windows-x64-debug
+
+          - name: Linux x64 Release (ubuntu)
+            os: ubuntu-latest
+            cmp: gcc
+            bcfg: default
+            artifact: pvxs-linux-x64-release
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Install Linux prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install libreadline-dev cmake
+
+      - name: Prepare and compile dependencies
+        run: python .ci/cue.py prepare
+
+      - name: Build bundled libevent
+        run: python .ci/cue.py exec python .ci-local/libevent.py
+
+      - name: Build PVXS
+        run: python .ci/cue.py build
+
+      - name: Collect shared libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          # Find all shared library outputs produced by the build
+          find . \
+            ! -path './.git/*' \
+            ! -path './bundle/*' \
+            -type f \( -name '*.dll' -o -name '*.so' -o -name '*.so.*' -o -name '*.dylib' \) \
+            -print > dist/all_libs.txt || true
+
+          # Copy files, skipping Python extension modules
+          while IFS= read -r f; do
+            case "$f" in
+              *python*|*site-packages*|*.pyd) continue ;;
+            esac
+            bn=$(basename "$f")
+            cp -v "$f" "dist/$bn" || true
+          done < dist/all_libs.txt
+
+          # Also collect PDB debug symbols on Windows
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            find . ! -path './.git/*' ! -path './bundle/*' -type f -name '*.pdb' -print > dist/pdb_files.txt || true
+            while IFS= read -r f; do
+              bn=$(basename "$f")
+              cp -v "$f" "dist/$bn" || true
+            done < dist/pdb_files.txt
+          fi
+
+          # Write manifest
+          {
+            echo "CMP=$CMP"
+            echo "BCFG=$BCFG"
+            echo "BASE=${{ inputs.base }}"
+            echo "GITHUB_SHA=$GITHUB_SHA"
+            echo "EPICS_HOST_ARCH=${EPICS_HOST_ARCH:-}"
+            echo "---"
+            echo "# Shared libraries found:"
+            cat dist/all_libs.txt
+          } > dist/manifest.txt
+
+          echo "=== dist contents ==="
+          ls -la dist/
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/
+          if-no-files-found: error
+
+  github-release:
+    name: Publish GitHub Release assets
+    needs: build
+    runs-on: ubuntu-latest
+    if: ${{ inputs.tag != '' }}
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          for d in artifacts/*/; do
+            name=$(basename "$d")
+            tar -C "$d" -czf "release/${name}.tar.gz" .
+            echo "Created release/${name}.tar.gz"
+          done
+          ls -la release/
+
+      - name: Create/Update GitHub Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.tag }}
+          draft: false
+          prerelease: false
+          files: release/*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
